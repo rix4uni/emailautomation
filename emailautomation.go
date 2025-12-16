@@ -975,23 +975,24 @@ func getMarkdownFiles(inputPath string) ([]string, error) {
 // 1. Extracts domain from the file
 // 2. Finds email recipients for that domain
 // 3. Sends email if recipients found, otherwise copies file to emailnotfound
-func processMarkdownFile(mdFilePath string, from, subject, appPassword, smtpHost, smtpPort string, useMarkdown bool, writeDebug bool, sentMap map[string]string) error {
+// Returns: (emailSent bool, error)
+func processMarkdownFile(mdFilePath string, from, subject, appPassword, smtpHost, smtpPort string, useMarkdown bool, writeDebug bool, sentMap map[string]string) (bool, error) {
 	// Calculate file hash
 	fileHash, err := calculateFileHash(mdFilePath)
 	if err != nil {
-		return fmt.Errorf("failed to calculate file hash: %w", err)
+		return false, fmt.Errorf("failed to calculate file hash: %w", err)
 	}
 
 	// Check if already sent
 	if isAlreadySent(mdFilePath, fileHash, sentMap) {
 		fmt.Printf("[%s] Already sent (skipping)\n", filepath.Base(mdFilePath))
-		return nil
+		return false, nil
 	}
 
 	// Read email body
 	body, err := os.ReadFile(mdFilePath)
 	if err != nil {
-		return fmt.Errorf("error reading %s: %w", mdFilePath, err)
+		return false, fmt.Errorf("error reading %s: %w", mdFilePath, err)
 	}
 
 	// Extract domain
@@ -1001,7 +1002,7 @@ func processMarkdownFile(mdFilePath string, from, subject, appPassword, smtpHost
 		if err := handleNoEmailsFound(mdFilePath); err != nil {
 			fmt.Printf("Error handling no emails: %v\n", err)
 		}
-		return err
+		return false, err
 	}
 
 	// Extract emails from domain
@@ -1009,9 +1010,9 @@ func processMarkdownFile(mdFilePath string, from, subject, appPassword, smtpHost
 	if err != nil || len(recipients) == 0 {
 		fmt.Printf("No emails found for %s, copying file to emailnotfound directory\n", mdFilePath)
 		if err := handleNoEmailsFound(mdFilePath); err != nil {
-			return fmt.Errorf("error handling no emails: %w", err)
+			return false, fmt.Errorf("error handling no emails: %w", err)
 		}
-		return nil
+		return false, nil // No email sent, no error
 	}
 
 	// Apply domain filter if flag is enabled
@@ -1019,13 +1020,13 @@ func processMarkdownFile(mdFilePath string, from, subject, appPassword, smtpHost
 		// Get the full URL from markdown to extract base domain
 		url, err := extractURLFromMarkdown(mdFilePath)
 		if err != nil {
-			return fmt.Errorf("failed to extract URL for domain filtering: %w", err)
+			return false, fmt.Errorf("failed to extract URL for domain filtering: %w", err)
 		}
 
 		// Extract base domain using tldinfo
 		baseDomain, err := extractBaseDomain(url)
 		if err != nil {
-			return fmt.Errorf("failed to extract base domain: %w", err)
+			return false, fmt.Errorf("failed to extract base domain: %w", err)
 		}
 
 		fmt.Printf("[%s] Filtering emails by base domain: %s\n", filepath.Base(mdFilePath), baseDomain)
@@ -1037,7 +1038,7 @@ func processMarkdownFile(mdFilePath string, from, subject, appPassword, smtpHost
 		if len(recipients) == 0 {
 			fmt.Printf("[%s] No emails match base domain %s (filtered from %d email(s)), skipping send\n",
 				filepath.Base(mdFilePath), baseDomain, originalCount)
-			return nil // Skip sending, but don't treat as error
+			return false, nil // No email sent, no error
 		}
 
 		fmt.Printf("[%s] Filtered to %d matching email(s) (from %d total)\n",
@@ -1062,9 +1063,9 @@ func processMarkdownFile(mdFilePath string, from, subject, appPassword, smtpHost
 	if err != nil {
 		// Check if it's a credential error
 		if isCredentialError(err) {
-			return fmt.Errorf("invalid credentials in config.yaml: %w", err)
+			return false, fmt.Errorf("invalid credentials in config.yaml: %w", err)
 		}
-		return fmt.Errorf("error sending email for %s: %w", mdFilePath, err)
+		return false, fmt.Errorf("error sending email for %s: %w", mdFilePath, err)
 	}
 
 	if useMarkdown {
@@ -1081,7 +1082,7 @@ func processMarkdownFile(mdFilePath string, from, subject, appPassword, smtpHost
 		// Don't fail the whole operation if logging fails
 	}
 
-	return nil
+	return true, nil // Email was sent successfully
 }
 
 func main() {
@@ -1157,7 +1158,7 @@ func main() {
 	for i, mdFilePath := range mdFiles {
 		fmt.Printf("--- Processing file %d/%d: %s ---\n", i+1, len(mdFiles), filepath.Base(mdFilePath))
 
-		err := processMarkdownFile(mdFilePath, from, subject, appPassword, smtpHost, smtpPort, useMarkdown, i == 0, sentMap)
+		emailSent, err := processMarkdownFile(mdFilePath, from, subject, appPassword, smtpHost, smtpPort, useMarkdown, i == 0, sentMap)
 		if err != nil {
 			// Check if it's a credential error - exit immediately
 			if isCredentialError(err) {
@@ -1175,8 +1176,8 @@ func main() {
 				sentMap[mdFilePath] = fileHash
 			}
 
-			// Add delay after successful send (but not after last file)
-			if i < len(mdFiles)-1 && *delaySeconds > 0 {
+			// Only delay if email was actually sent (and not last file)
+			if emailSent && i < len(mdFiles)-1 && *delaySeconds > 0 {
 				fmt.Printf("Waiting %d seconds before processing next file...\n", *delaySeconds)
 				time.Sleep(time.Duration(*delaySeconds) * time.Second)
 			}
