@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 
 	"io"
@@ -59,6 +60,7 @@ var domainFilter = pflag.Bool("domain-filter", false, "Filter emails to only inc
 var delaySeconds = pflag.Int("delay", 300, "Delay in seconds between email sends (default: 300 for Gmail's 500/day limit)")
 var silent = pflag.Bool("silent", false, "Silent mode.")
 var version = pflag.Bool("version", false, "Print the version of the tool and exit.")
+var emailVerify = pflag.Bool("emailverify", false, "Only send to recipients where emailverify checked_count == 3")
 
 // Embedded CSS from Markdown Here
 const defaultCSS = `/* This is the overall wrapper, it should be treated as the body section. */
@@ -736,6 +738,51 @@ func filterEmailsByDomain(emails []string, baseDomain string) []string {
 	return filtered
 }
 
+type emailVerifyResult struct {
+	CheckedCount int `json:"checked_count"`
+}
+
+// runEmailVerify executes `emailverify --silent --json` for a single email and returns checked_count.
+func runEmailVerify(email string) (int, error) {
+	// Execute: echo "user@example.com" | emailverify --silent --json
+	cmd := exec.Command("sh", "-c", fmt.Sprintf("echo %q | emailverify --silent --json", email))
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("emailverify failed: %w", err)
+	}
+
+	outStr := strings.TrimSpace(stripANSI(string(output)))
+	if outStr == "" {
+		return 0, fmt.Errorf("emailverify returned empty output")
+	}
+
+	var res emailVerifyResult
+	if err := json.Unmarshal([]byte(outStr), &res); err != nil {
+		return 0, fmt.Errorf("failed to parse emailverify JSON: %w", err)
+	}
+
+	return res.CheckedCount, nil
+}
+
+// filterRecipientsByEmailVerify keeps only emails where emailverify checked_count == 3.
+// If emailverify fails or output can't be parsed, the email is treated as not verified (skipped).
+func filterRecipientsByEmailVerify(recipients []string) ([]string, error) {
+	filtered := make([]string, 0, len(recipients))
+	for _, r := range recipients {
+		checked, err := runEmailVerify(r)
+		if err != nil {
+			if !*silent {
+				fmt.Printf("Warning: emailverify failed for %s: %v\n", r, err)
+			}
+			continue
+		}
+		if checked == 3 {
+			filtered = append(filtered, r)
+		}
+	}
+	return filtered, nil
+}
+
 // stripANSI removes ANSI escape sequences from a string
 func stripANSI(s string) string {
 	// Match ANSI escape sequences: \x1b[ or \033[ followed by numbers and ending with m
@@ -1042,6 +1089,22 @@ func processMarkdownFile(mdFilePath string, from, subject, appPassword, smtpHost
 		}
 
 		fmt.Printf("[%s] Filtered to %d matching email(s) (from %d total)\n",
+			filepath.Base(mdFilePath), len(recipients), originalCount)
+	}
+
+	// Apply emailverify filter if flag is enabled
+	if *emailVerify {
+		originalCount := len(recipients)
+		filtered, _ := filterRecipientsByEmailVerify(recipients)
+		recipients = filtered
+
+		if len(recipients) == 0 {
+			fmt.Printf("[%s] No emails passed emailverify (checked_count == 3) (filtered from %d email(s)), skipping send\n",
+				filepath.Base(mdFilePath), originalCount)
+			return false, nil // No email sent, no error
+		}
+
+		fmt.Printf("[%s] Emailverify kept %d email(s) (from %d total)\n",
 			filepath.Base(mdFilePath), len(recipients), originalCount)
 	}
 

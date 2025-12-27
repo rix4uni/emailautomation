@@ -23,6 +23,7 @@ A powerful Go-based tool for automating bug bounty report emails. This tool proc
   ```
   pipx install --force git+https://github.com/rix4uni/tldinfo.git
   ```
+- **emailverify**: Required for recipient verification (optional, only if using `--emailverify`). Must be available in your `PATH`.
 
 ## Installation
 ```
@@ -31,9 +32,9 @@ go install github.com/rix4uni/emailautomation@latest
 
 ## Download prebuilt binaries
 ```
-wget https://github.com/rix4uni/emailautomation/releases/download/v0.0.1/emailautomation-linux-amd64-0.0.1.tgz
-tar -xvzf emailautomation-linux-amd64-0.0.1.tgz
-rm -rf emailautomation-linux-amd64-0.0.1.tgz
+wget https://github.com/rix4uni/emailautomation/releases/download/v0.0.2/emailautomation-linux-amd64-0.0.2.tgz
+tar -xvzf emailautomation-linux-amd64-0.0.2.tgz
+rm -rf emailautomation-linux-amd64-0.0.2.tgz
 mv emailautomation ~/go/bin/emailautomation
 ```
 Or download [binary release](https://github.com/rix4uni/emailautomation/releases) for your platform.
@@ -112,6 +113,7 @@ emailautomation --markdown-file /path/to/reports
 | `--markdown-file` | string | `mdfile` | Path to a single .md file or directory containing .md files |
 | `--id` | string | `1` | Credential ID to use from config.yaml |
 | `--domain-filter` | bool | `false` | Filter emails to only include those matching the base domain |
+| `--emailverify` | bool | `false` | Only send to recipients where `emailverify --json` returns `checked_count == 3` |
 | `--delay` | int | `300` | Delay in seconds between email sends (default: 300 for Gmail's 500/day limit) |
 | `--debug` | bool | `false` | Write email message to email_debug.txt for debugging |
 | `--nomarkdown` | bool | `false` | Send email as plain text instead of HTML |
