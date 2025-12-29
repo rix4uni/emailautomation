@@ -44,12 +44,13 @@ type Config struct {
 
 // Credential represents a single credential entry
 type Credential struct {
-	ID          string `yaml:"id"`
-	Email       string `yaml:"email"`
-	AppPassword string `yaml:"app_password"`
-	SMTPHost    string `yaml:"smtp_host"`
-	SMTPPort    string `yaml:"smtp_port"`
-	Subject     string `yaml:"subject"`
+	ID           string `yaml:"id"`
+	Email        string `yaml:"email"`
+	AppPassword  string `yaml:"app_password"`
+	SMTPHost     string `yaml:"smtp_host"`
+	SMTPPort     string `yaml:"smtp_port"`
+	Subject      string `yaml:"subject"`
+	SMTPUsername string `yaml:"smtp_username,omitempty"` // Optional: for AWS SES SMTP, defaults to email if not provided
 }
 
 var noMarkdown = pflag.Bool("nomarkdown", false, "Send email as plain text instead of HTML")
@@ -1035,7 +1036,7 @@ func getMarkdownFiles(inputPath string) ([]string, error) {
 // 2. Finds email recipients for that domain
 // 3. Sends email if recipients found, otherwise copies file to skippedemails
 // Returns: (emailSent bool, error)
-func processMarkdownFile(mdFilePath string, from, subject, appPassword, smtpHost, smtpPort string, useMarkdown bool, writeDebug bool, sentMap map[string]string) (bool, error) {
+func processMarkdownFile(mdFilePath string, from, subject, appPassword, smtpHost, smtpPort, smtpUsername string, useMarkdown bool, writeDebug bool, sentMap map[string]string) (bool, error) {
 	// Calculate file hash
 	fileHash, err := calculateFileHash(mdFilePath)
 	if err != nil {
@@ -1126,7 +1127,12 @@ func processMarkdownFile(mdFilePath string, from, subject, appPassword, smtpHost
 	fmt.Printf("[%s] Found %d email(s), sending one email to all recipients...\n", filepath.Base(mdFilePath), len(recipients))
 
 	// SMTP authentication
-	auth := smtp.PlainAuth("", from, appPassword, smtpHost)
+	// Use smtp_username if provided (for AWS SES), otherwise use email address (for Gmail)
+	identity := from
+	if smtpUsername != "" {
+		identity = smtpUsername
+	}
+	auth := smtp.PlainAuth("", identity, appPassword, smtpHost)
 	addr := smtpHost + ":" + smtpPort
 
 	// Compose and send email
@@ -1206,6 +1212,7 @@ func main() {
 	appPassword := cred.AppPassword
 	smtpHost := cred.SMTPHost
 	smtpPort := cred.SMTPPort
+	smtpUsername := cred.SMTPUsername
 
 	useMarkdown := !*noMarkdown
 
@@ -1236,7 +1243,7 @@ func main() {
 	for i, mdFilePath := range mdFiles {
 		fmt.Printf("--- Processing file %d/%d: %s ---\n", i+1, len(mdFiles), filepath.Base(mdFilePath))
 
-		emailSent, err := processMarkdownFile(mdFilePath, from, subject, appPassword, smtpHost, smtpPort, useMarkdown, i == 0, sentMap)
+		emailSent, err := processMarkdownFile(mdFilePath, from, subject, appPassword, smtpHost, smtpPort, smtpUsername, useMarkdown, i == 0, sentMap)
 		if err != nil {
 			// Check if it's a credential error - exit immediately
 			if isCredentialError(err) {
