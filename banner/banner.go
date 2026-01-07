@@ -5,10 +5,10 @@ import (
 )
 
 // prints the version message
-const version = "v0.0.4"
+const version = "v0.0.5"
 
 func PrintVersion() {
-	fmt.Printf("Current ipfinder version %s\n", version)
+	fmt.Printf("Current emailautomation version %s\n", version)
 }
 
 // Prints the Colorful banner
@@ -20,5 +20,5 @@ func PrintBanner() {
 /  __// / / / / // /_/ // // // /_/ // /_/ // /_ / /_/ // / / / / // /_/ // /_ / // /_/ // / / /
 \___//_/ /_/ /_/ \__,_//_//_/ \__,_/ \__,_/ \__/ \____//_/ /_/ /_/ \__,_/ \__//_/ \____//_/ /_/
 `
-	fmt.Printf("%s\n%75s\n\n", banner, "Current ipfinder version "+version)
+	fmt.Printf("%s\n%75s\n\n", banner, "Current emailautomation version "+version)
 }

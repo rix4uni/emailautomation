@@ -7,7 +7,7 @@ require (
 	github.com/alecthomas/chroma v0.10.0
 	github.com/spf13/pflag v1.0.10
 	github.com/vanng822/go-premailer v1.30.0
-	github.com/yuin/goldmark v1.7.13
+	github.com/yuin/goldmark v1.7.16
 	gopkg.in/yaml.v3 v3.0.1
 )
 

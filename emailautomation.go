@@ -3,9 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 
@@ -19,6 +17,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rix4uni/emailautomation/banner"
@@ -53,6 +52,157 @@ type Credential struct {
 	SMTPUsername string `yaml:"smtp_username,omitempty"` // Optional: for AWS SES SMTP, defaults to email if not provided
 }
 
+// RateLimiter implements a token bucket rate limiter
+type RateLimiter struct {
+	tokens     float64
+	maxTokens  float64
+	refillRate float64 // tokens per second
+	lastRefill time.Time
+	mu         sync.Mutex
+}
+
+// newRateLimiter creates a new rate limiter with the specified rate (tokens per second)
+func newRateLimiter(rate float64) *RateLimiter {
+	return &RateLimiter{
+		tokens:     rate,
+		maxTokens:  rate,
+		refillRate: rate,
+		lastRefill: time.Now(),
+	}
+}
+
+// Wait blocks until a token is available, implementing token bucket algorithm
+func (rl *RateLimiter) Wait() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	for {
+		// Refill tokens based on time elapsed
+		now := time.Now()
+		elapsed := now.Sub(rl.lastRefill).Seconds()
+		rl.tokens += elapsed * rl.refillRate
+		if rl.tokens > rl.maxTokens {
+			rl.tokens = rl.maxTokens
+		}
+		rl.lastRefill = now
+
+		// If we have at least 1 token, consume it and return
+		if rl.tokens >= 1.0 {
+			rl.tokens -= 1.0
+			return
+		}
+
+		// Calculate how long to wait for next token
+		tokensNeeded := 1.0 - rl.tokens
+		waitDuration := time.Duration(tokensNeeded/rl.refillRate*1000) * time.Millisecond
+
+		// Release lock while sleeping
+		rl.mu.Unlock()
+		time.Sleep(waitDuration)
+		rl.mu.Lock()
+	}
+}
+
+// safePrintf provides thread-safe printing
+func safePrintf(format string, args ...interface{}) {
+	printMutex.Lock()
+	defer printMutex.Unlock()
+	fmt.Printf(format, args...)
+}
+
+// safePrintln provides thread-safe printing with newline
+func safePrintln(args ...interface{}) {
+	printMutex.Lock()
+	defer printMutex.Unlock()
+	fmt.Println(args...)
+}
+
+// isAlreadySentSafe checks if ANY recipient has already been sent to (thread-safe)
+func isAlreadySentSafe(recipients []string, sentMap map[string]bool) bool {
+	sentMapMutex.RLock()
+	defer sentMapMutex.RUnlock()
+
+	// Check if any recipient exists in sentMap
+	for _, email := range recipients {
+		if sentMap[email] {
+			return true // Already sent to at least one recipient
+		}
+	}
+	return false // None of the recipients have been sent to
+}
+
+// updateSentMapSafe updates the sentMap with new emails in a thread-safe manner
+func updateSentMapSafe(sentMap map[string]bool, emails []string) {
+	sentMapMutex.Lock()
+	defer sentMapMutex.Unlock()
+
+	for _, email := range emails {
+		sentMap[email] = true
+	}
+}
+
+// FileJob represents a file processing job
+type FileJob struct {
+	filePath     string
+	fileIndex    int
+	totalFiles   int
+	from         string
+	subject      string
+	appPassword  string
+	smtpHost     string
+	smtpPort     string
+	smtpUsername string
+	useMarkdown  bool
+	sentMap      map[string]bool
+}
+
+// JobResult represents the result of processing a file
+type JobResult struct {
+	filePath   string
+	success    bool
+	emailSent  bool
+	recipients []string
+	err        error
+}
+
+// worker processes files from the jobs channel
+func worker(id int, jobs <-chan FileJob, results chan<- JobResult, rateLimiter *RateLimiter, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for job := range jobs {
+		// Acquire rate limit token before processing
+		if rateLimiter != nil {
+			rateLimiter.Wait()
+		}
+
+		safePrintf("--- [Worker %d] Processing file %d/%d: %s ---\n",
+			id, job.fileIndex+1, job.totalFiles, filepath.Base(job.filePath))
+
+		emailSent, err := processMarkdownFile(
+			job.filePath,
+			job.from,
+			job.subject,
+			job.appPassword,
+			job.smtpHost,
+			job.smtpPort,
+			job.smtpUsername,
+			job.useMarkdown,
+			false, // writeDebug - disable in parallel mode
+			job.sentMap,
+		)
+
+		result := JobResult{
+			filePath:  job.filePath,
+			success:   err == nil,
+			emailSent: emailSent,
+			err:       err,
+		}
+
+		results <- result
+		safePrintln()
+	}
+}
+
 var noMarkdown = pflag.Bool("nomarkdown", false, "Send email as plain text instead of HTML")
 var debugEmail = pflag.Bool("debug", false, "Write email message to email_debug.txt for debugging")
 var markdownFile = pflag.String("markdown-file", "mdfile", "Path to a single .md file or directory containing .md files")
@@ -62,6 +212,13 @@ var delaySeconds = pflag.Int("delay", 300, "Delay in seconds between email sends
 var silent = pflag.Bool("silent", false, "Silent mode.")
 var version = pflag.Bool("version", false, "Print the version of the tool and exit.")
 var emailVerify = pflag.Bool("emailverify", false, "Only send to recipients where emailverify checked_count == 3")
+var parallel = pflag.Int("parallel", 1, "Number of parallel workers to process files concurrently (default: 1 for sequential)")
+
+// Global mutexes for thread-safe operations
+var (
+	sentMapMutex sync.RWMutex
+	printMutex   sync.Mutex
+)
 
 // Embedded CSS from Markdown Here
 const defaultCSS = `/* This is the overall wrapper, it should be treated as the body section. */
@@ -928,7 +1085,7 @@ func getCredentialByID(config *Config, id string) (*Credential, error) {
 	return nil, fmt.Errorf("credential with ID '%s' not found in config.yaml", id)
 }
 
-const sentEmailsLogFile = "sent_emails.log"
+var sentEmailsLogFile string
 
 // isCredentialError checks if the error is an SMTP authentication/credential error
 func isCredentialError(err error) bool {
@@ -943,20 +1100,10 @@ func isCredentialError(err error) bool {
 		strings.Contains(errStr, "535")
 }
 
-// calculateFileHash calculates SHA256 hash of file content
-func calculateFileHash(filePath string) (string, error) {
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		return "", err
-	}
-	hash := sha256.Sum256(content)
-	return hex.EncodeToString(hash[:]), nil
-}
-
-// loadSentEmails reads the log file and returns a map of file path -> hash
-// Format: filepath|hash (one per line)
-func loadSentEmails() (map[string]string, error) {
-	sentMap := make(map[string]string)
+// loadSentEmails reads the log file and returns a set of sent email addresses
+// Format: one email per line
+func loadSentEmails() (map[string]bool, error) {
+	sentMap := make(map[string]bool)
 
 	if _, err := os.Stat(sentEmailsLogFile); os.IsNotExist(err) {
 		return sentMap, nil // File doesn't exist yet, return empty map
@@ -973,36 +1120,29 @@ func loadSentEmails() (map[string]string, error) {
 		if line == "" {
 			continue
 		}
-		parts := strings.Split(line, "|")
-		if len(parts) == 2 {
-			sentMap[parts[0]] = parts[1]
-		}
+		// Each line is a single email address
+		sentMap[line] = true
 	}
 
 	return sentMap, nil
 }
 
-// markAsSent appends a file path and hash to the log file
-func markAsSent(filePath string, hash string) error {
-	logEntry := fmt.Sprintf("%s|%s\n", filePath, hash)
+// markAsSent appends recipient emails to the log file (one per line)
+func markAsSent(emails []string) error {
 	f, err := os.OpenFile(sentEmailsLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to open log file: %w", err)
 	}
 	defer f.Close()
 
-	_, err = f.WriteString(logEntry)
-	if err != nil {
-		return fmt.Errorf("failed to write to log file: %w", err)
+	for _, email := range emails {
+		_, err = f.WriteString(email + "\n")
+		if err != nil {
+			return fmt.Errorf("failed to write to log file: %w", err)
+		}
 	}
 
 	return nil
-}
-
-// isAlreadySent checks if a file (with its current hash) has already been sent
-func isAlreadySent(filePath string, currentHash string, sentMap map[string]string) bool {
-	storedHash, exists := sentMap[filePath]
-	return exists && storedHash == currentHash
 }
 
 // getMarkdownFiles returns a list of .md file paths
@@ -1036,19 +1176,7 @@ func getMarkdownFiles(inputPath string) ([]string, error) {
 // 2. Finds email recipients for that domain
 // 3. Sends email if recipients found, otherwise copies file to skippedemails
 // Returns: (emailSent bool, error)
-func processMarkdownFile(mdFilePath string, from, subject, appPassword, smtpHost, smtpPort, smtpUsername string, useMarkdown bool, writeDebug bool, sentMap map[string]string) (bool, error) {
-	// Calculate file hash
-	fileHash, err := calculateFileHash(mdFilePath)
-	if err != nil {
-		return false, fmt.Errorf("failed to calculate file hash: %w", err)
-	}
-
-	// Check if already sent
-	if isAlreadySent(mdFilePath, fileHash, sentMap) {
-		fmt.Printf("[%s] Already sent (skipping)\n", filepath.Base(mdFilePath))
-		return false, nil
-	}
-
+func processMarkdownFile(mdFilePath string, from, subject, appPassword, smtpHost, smtpPort, smtpUsername string, useMarkdown bool, writeDebug bool, sentMap map[string]bool) (bool, error) {
 	// Read email body
 	body, err := os.ReadFile(mdFilePath)
 	if err != nil {
@@ -1070,6 +1198,12 @@ func processMarkdownFile(mdFilePath string, from, subject, appPassword, smtpHost
 			return false, fmt.Errorf("error handling skipped email: %w", err)
 		}
 		return false, nil // No email sent, no error
+	}
+
+	// Check if already sent to any of these recipients (thread-safe)
+	if isAlreadySentSafe(recipients, sentMap) {
+		fmt.Printf("[%s] Already sent to these recipients (skipping)\n", filepath.Base(mdFilePath))
+		return false, nil
 	}
 
 	// Apply domain filter if flag is enabled
@@ -1160,11 +1294,14 @@ func processMarkdownFile(mdFilePath string, from, subject, appPassword, smtpHost
 			filepath.Base(mdFilePath), len(recipients), strings.Join(recipients, ", "))
 	}
 
-	// Mark as sent
-	if err := markAsSent(mdFilePath, fileHash); err != nil {
+	// Mark as sent - save all recipient emails to log file
+	if err := markAsSent(recipients); err != nil {
 		fmt.Printf("Warning: Failed to log sent email: %v\n", err)
 		// Don't fail the whole operation if logging fails
 	}
+
+	// Update in-memory map for this run (thread-safe)
+	updateSentMapSafe(sentMap, recipients)
 
 	return true, nil // Email was sent successfully
 }
@@ -1182,6 +1319,18 @@ func main() {
 	// Don't Print banner if -silent flag is provided
 	if !*silent {
 		banner.PrintBanner()
+	}
+
+	// Initialize sent emails log path
+	homeDir, err := os.UserHomeDir()
+	if err == nil {
+		logDir := filepath.Join(homeDir, ".config", "emailautomation")
+		// Create directory if it doesn't exist
+		os.MkdirAll(logDir, 0755)
+		sentEmailsLogFile = filepath.Join(logDir, "sent_emails.log")
+	} else {
+		// Fallback to current directory if home dir not available
+		sentEmailsLogFile = "sent_emails.log"
 	}
 
 	// Load configuration
@@ -1220,7 +1369,7 @@ func main() {
 	sentMap, err := loadSentEmails()
 	if err != nil {
 		fmt.Printf("Warning: Failed to load sent emails log: %v\n", err)
-		sentMap = make(map[string]string) // Continue with empty map
+		sentMap = make(map[string]bool) // Continue with empty map
 	}
 
 	// Get list of markdown files to process
@@ -1237,40 +1386,95 @@ func main() {
 
 	fmt.Printf("Processing %d markdown file(s)...\n\n", len(mdFiles))
 
-	// Process each file
-	successCount := 0
-	errorCount := 0
-	for i, mdFilePath := range mdFiles {
-		fmt.Printf("--- Processing file %d/%d: %s ---\n", i+1, len(mdFiles), filepath.Base(mdFilePath))
+	var successCount, errorCount int
 
-		emailSent, err := processMarkdownFile(mdFilePath, from, subject, appPassword, smtpHost, smtpPort, smtpUsername, useMarkdown, i == 0, sentMap)
-		if err != nil {
-			// Check if it's a credential error - exit immediately
-			if isCredentialError(err) {
-				fmt.Printf("Fatal error: %v\n", err)
-				fmt.Println("Please check your credentials in config.yaml and ensure they are correct.")
-				os.Exit(1)
-			}
-			errorCount++
-			fmt.Printf("Error processing %s: %v\n\n", mdFilePath, err)
-		} else {
-			successCount++
-			// Update in-memory map after successful send (for efficiency in same run)
-			fileHash, hashErr := calculateFileHash(mdFilePath)
-			if hashErr == nil {
-				sentMap[mdFilePath] = fileHash
-			}
+	// Choose processing mode based on parallel flag
+	if *parallel <= 1 {
+		// Sequential mode (original behavior)
+		for i, mdFilePath := range mdFiles {
+			fmt.Printf("--- Processing file %d/%d: %s ---\n", i+1, len(mdFiles), filepath.Base(mdFilePath))
 
-			// Only delay if email was actually sent (and not last file)
-			if emailSent && i < len(mdFiles)-1 && *delaySeconds > 0 {
-				fmt.Printf("Waiting %d seconds before processing next file...\n", *delaySeconds)
-				time.Sleep(time.Duration(*delaySeconds) * time.Second)
+			emailSent, err := processMarkdownFile(mdFilePath, from, subject, appPassword, smtpHost, smtpPort, smtpUsername, useMarkdown, i == 0, sentMap)
+			if err != nil {
+				// Check if it's a credential error - exit immediately
+				if isCredentialError(err) {
+					fmt.Printf("Fatal error: %v\n", err)
+					fmt.Println("Please check your credentials in config.yaml and ensure they are correct.")
+					os.Exit(1)
+				}
+				errorCount++
+				fmt.Printf("Error processing %s: %v\n\n", mdFilePath, err)
+			} else {
+				successCount++
+				// Only delay if email was actually sent (and not last file)
+				if emailSent && i < len(mdFiles)-1 && *delaySeconds > 0 {
+					fmt.Printf("Waiting %d seconds before processing next file...\n", *delaySeconds)
+					time.Sleep(time.Duration(*delaySeconds) * time.Second)
+				}
+			}
+			fmt.Println()
+		}
+	} else {
+		// Parallel mode with rate limiting
+		fmt.Printf("Using parallel mode with %d workers and rate limiting (14 emails/sec)...\n\n", *parallel)
+
+		// Create rate limiter (14 emails per second for AWS SES)
+		rateLimiter := newRateLimiter(14.0)
+
+		// Create channels
+		jobs := make(chan FileJob, len(mdFiles))
+		results := make(chan JobResult, len(mdFiles))
+
+		// Start workers
+		var wg sync.WaitGroup
+		for w := 1; w <= *parallel; w++ {
+			wg.Add(1)
+			go worker(w, jobs, results, rateLimiter, &wg)
+		}
+
+		// Send jobs to workers
+		for i, mdFilePath := range mdFiles {
+			jobs <- FileJob{
+				filePath:     mdFilePath,
+				fileIndex:    i,
+				totalFiles:   len(mdFiles),
+				from:         from,
+				subject:      subject,
+				appPassword:  appPassword,
+				smtpHost:     smtpHost,
+				smtpPort:     smtpPort,
+				smtpUsername: smtpUsername,
+				useMarkdown:  useMarkdown,
+				sentMap:      sentMap,
 			}
 		}
-		fmt.Println()
+		close(jobs)
+
+		// Collect results in a separate goroutine
+		go func() {
+			wg.Wait()
+			close(results)
+		}()
+
+		// Process results
+		for result := range results {
+			if result.err != nil {
+				// Check if it's a credential error - exit immediately
+				if isCredentialError(result.err) {
+					safePrintf("Fatal error: %v\n", result.err)
+					safePrintln("Please check your credentials in config.yaml and ensure they are correct.")
+					os.Exit(1)
+				}
+				errorCount++
+				safePrintf("Error processing %s: %v\n", result.filePath, result.err)
+			} else {
+				successCount++
+				// In-memory map is updated by processMarkdownFile
+			}
+		}
 	}
 
-	fmt.Printf("Processing complete: %d succeeded, %d failed\n", successCount, errorCount)
+	fmt.Printf("\nProcessing complete: %d succeeded, %d failed\n", successCount, errorCount)
 
 	if errorCount > 0 {
 		os.Exit(1)

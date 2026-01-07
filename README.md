@@ -5,9 +5,10 @@ A powerful Go-based tool for automating bug bounty report emails. This tool proc
 ## Features
 
 - **Multi-file Processing**: Process single markdown files or entire directories
+- **Parallel Processing**: Process multiple files concurrently with intelligent rate limiting (NEW!)
 - **Automatic Email Extraction**: Automatically finds email addresses from target domains using `emailextractor`
 - **Domain Filtering**: Filter emails to only include those matching the base domain (optional)
-- **Rate Limiting**: Built-in delay between emails to comply with Gmail's 500 emails/day limit
+- **Smart Rate Limiting**: Token bucket algorithm ensures compliance with AWS SES limits (14 emails/sec)
 - **Duplicate Prevention**: Tracks sent emails using content hashing to prevent duplicate sends
 - **Config-based Credentials**: Secure credential management via YAML configuration files
 - **Multiple SMTP Providers**: Support for Gmail and AWS SES SMTP servers
@@ -15,6 +16,7 @@ A powerful Go-based tool for automating bug bounty report emails. This tool proc
 - **Debug Mode**: Save email messages to file for inspection
 - **Multiple Credential Profiles**: Support for multiple email accounts via credential IDs
 - **Email Verification**: Optional filtering using `emailverify` tool to ensure recipient validity
+- **Thread-Safe**: Concurrent processing with mutex-protected shared resources
 
 ### Prerequisites
 - **emailextractor**: Required for email extraction from domains
@@ -34,9 +36,9 @@ go install github.com/rix4uni/emailautomation@latest
 
 ## Download prebuilt binaries
 ```
-wget https://github.com/rix4uni/emailautomation/releases/download/v0.0.4/emailautomation-linux-amd64-0.0.4.tgz
-tar -xvzf emailautomation-linux-amd64-0.0.4.tgz
-rm -rf emailautomation-linux-amd64-0.0.4.tgz
+wget https://github.com/rix4uni/emailautomation/releases/download/v0.0.5/emailautomation-linux-amd64-0.0.5.tgz
+tar -xvzf emailautomation-linux-amd64-0.0.5.tgz
+rm -rf emailautomation-linux-amd64-0.0.5.tgz
 mv emailautomation ~/go/bin/emailautomation
 ```
 Or download [binary release](https://github.com/rix4uni/emailautomation/releases) for your platform.
@@ -194,36 +196,38 @@ Check the `email_debug.txt` file to verify the email format, then check your inb
 - **"Rate limit exceeded"**: Check your SES sending limits in Account dashboard
 - **"Connection timeout"**: Verify `smtp_host` matches your AWS region
 
-#### AWS SES Optimization: High-Speed Sending
+#### AWS SES Optimization: High-Speed Parallel Sending
 
-AWS SES can send emails **14x faster** than Gmail due to much higher sending limits. For optimal performance with AWS SES, use these recommended flags:
+AWS SES can send emails **up to 4200x faster** than Gmail when using parallel mode. For optimal performance with AWS SES, use parallel processing:
 
 ```bash
-emailautomation --domain-filter --emailverify --markdown-file mdfile --id 3 --delay 1
+emailautomation --domain-filter --emailverify --markdown-file mdfile --id 3 --parallel 10
 ```
 
 **Why these flags for AWS SES?**
 
 - **`--domain-filter`**: Filters emails to only include recipients matching the base domain, ensuring higher deliverability and relevance
 - **`--emailverify`**: Only sends to recipients where `emailverify` returns `checked_count == 3`, ensuring valid and verified email addresses
-- **`--delay 1`**: Uses a 1-second delay between emails (vs. 300 seconds for Gmail) because AWS SES has much higher sending limits:
-  - **Gmail**: 500 emails/day limit → requires 300-second delay
-  - **AWS SES**: Up to 50,000+ emails/day (depending on account limits) → can use 1-second delay
+- **`--parallel 10`**: Process 10 files concurrently with automatic rate limiting (14 emails/sec)
+  - **Gmail**: 500 emails/day limit → use sequential mode only
+  - **AWS SES**: Up to 50,000+ emails/day (depending on account limits) → use parallel mode
 - **`--id 3`**: Uses AWS SES credential profile (adjust to match your AWS SES credential ID)
 
 **Performance Comparison:**
 
-| Provider | Daily Limit | Recommended Delay | Emails/Hour |
-|----------|-------------|-------------------|-------------|
-| Gmail | 500 | 300 seconds | ~12 |
-| AWS SES | 50,000+ | 1 second | ~3,600 |
+| Provider | Mode | Workers | Rate Limit | Emails/Hour | Time for 1000 emails |
+|----------|------|---------|------------|-------------|---------------------|
+| Gmail | Sequential | 1 | 300s delay | ~12 | ~83 hours |
+| AWS SES | Sequential | 1 | 1s delay | ~3,600 | ~17 minutes |
+| AWS SES | Parallel | 10 | 14/sec | ~50,400 | ~1.2 minutes |
 
 **Important Notes:**
 
-- Only use `--delay 1` with AWS SES, not with Gmail (will hit rate limits)
+- Only use `--parallel > 1` with AWS SES, not with Gmail (will hit rate limits)
 - Always use `--domain-filter` and `--emailverify` for better deliverability and to avoid spam
+- Rate limiting is automatic in parallel mode (ignores `--delay` flag)
 - Check your AWS SES sending limits in the SES Console → Account dashboard
-- If you're still in sandbox mode, you're limited to 200 emails/day regardless of delay
+- If you're still in sandbox mode, you're limited to 200 emails/day regardless of settings
 
 ### Multiple Credential Profiles
 
@@ -256,7 +260,8 @@ emailautomation --markdown-file /path/to/reports
 | `--id` | string | `1` | Credential ID to use from config.yaml |
 | `--domain-filter` | bool | `false` | Filter emails to only include those matching the base domain |
 | `--emailverify` | bool | `false` | Only send to recipients where `emailverify --json` returns `checked_count == 3` |
-| `--delay` | int | `300` | Delay in seconds between email sends (default: 300 for Gmail's 500/day limit) |
+| `--parallel` | int | `1` | Number of parallel workers to process files concurrently (default: 1 for sequential) |
+| `--delay` | int | `300` | Delay in seconds between email sends (default: 300 for Gmail's 500/day limit, ignored when --parallel > 1) |
 | `--debug` | bool | `false` | Write email message to email_debug.txt for debugging |
 | `--nomarkdown` | bool | `false` | Send email as plain text instead of HTML |
 | `--silent` | bool | `false` | Silent mode |
@@ -318,21 +323,46 @@ Send emails as plain text instead of HTML:
 emailautomation --nomarkdown
 ```
 
-#### AWS SES High-Speed Sending
+#### AWS SES High-Speed Sending (Parallel Mode)
 
-Optimized command for AWS SES (14x faster than Gmail):
+Optimized command for AWS SES with parallel processing to maximize throughput:
 
 ```bash
-emailautomation --domain-filter --emailverify --markdown-file mdfile --id 3 --delay 1
+emailautomation --domain-filter --emailverify --markdown-file mdfile --id 3 --parallel 10
 ```
 
 This configuration uses:
 - `--domain-filter`: Only send to emails matching the base domain
 - `--emailverify`: Only send to verified email addresses (checked_count == 3)
-- `--delay 1`: 1-second delay (AWS SES can handle much higher throughput than Gmail)
+- `--parallel 10`: Process 10 files concurrently with smart rate limiting (14 emails/sec)
 - `--id 3`: AWS SES credential profile
 
-**Note**: Only use `--delay 1` with AWS SES. For Gmail, use `--delay 300` to comply with the 500 emails/day limit.
+**Performance with Parallel Mode:**
+
+| Mode | Workers | Rate Limit | Throughput |
+|------|---------|------------|------------|
+| Sequential | 1 | 300s delay | ~12 emails/hour |
+| Sequential (AWS SES) | 1 | 1s delay | ~3,600 emails/hour |
+| Parallel (AWS SES) | 10 | 14/sec global | ~50,400 emails/hour |
+
+**Note**: 
+- Use `--parallel` with AWS SES to fully utilize its capacity (50k emails/24hr)
+- The `--delay` flag is ignored when `--parallel > 1` (rate limiting is automatic)
+- For Gmail, use `--delay 300` without parallel mode to comply with 500 emails/day limit
+
+#### Parallel Processing Examples
+
+Process 10 files concurrently (recommended for AWS SES):
+
+```bash
+emailautomation --markdown-file reports --id 3 --parallel 10 --domain-filter --emailverify
+```
+
+Process 50 files concurrently for maximum throughput:
+
+```bash
+emailautomation --markdown-file reports --id 3 --parallel 50 --domain-filter --emailverify
+```
 
 #### Combined Flags
 
@@ -373,6 +403,7 @@ Type: Remote Code Execution
 
 ## How It Works
 
+### Sequential Mode (default, --parallel 1)
 1. **File Processing**: Reads markdown files from the specified location
 2. **Domain Extraction**: Extracts the target domain from the "## Target" section
 3. **Email Discovery**: Uses `emailextractor` to find email addresses from the domain and subdomains
@@ -380,7 +411,28 @@ Type: Remote Code Execution
 5. **Duplicate Check**: Checks if the file has already been sent (using content hash)
 6. **Email Composition**: Converts markdown to HTML with syntax highlighting
 7. **Email Sending**: Sends email to all recipients (visible to each other)
-8. **Logging**: Records sent emails in `sent_emails.log` to prevent duplicates
+8. **Delay**: Waits specified delay before processing next file
+9. **Logging**: Records sent emails in `sent_emails.log` to prevent duplicates
+
+### Parallel Mode (--parallel > 1)
+1. **File Processing**: Reads all markdown files from the specified location
+2. **Worker Pool**: Creates N worker goroutines based on `--parallel` value
+3. **Job Distribution**: Distributes files to workers via channel
+4. **Rate Limiting**: Each worker acquires token from global rate limiter (14/sec for AWS SES)
+5. **Concurrent Processing**: Workers process files concurrently:
+   - Domain extraction
+   - Email discovery
+   - Domain filtering (optional)
+   - Duplicate check (thread-safe)
+   - Email composition
+   - Email sending
+6. **Result Collection**: Aggregates results from all workers
+7. **Thread-Safe Logging**: Records sent emails with mutex protection
+
+**Key Differences:**
+- Parallel mode ignores `--delay` flag (uses rate limiting instead)
+- Thread-safe access to shared resources (sentMap, console output)
+- Much higher throughput for AWS SES (up to 50k emails/24hr)
 
 ## File Structure
 
@@ -440,29 +492,68 @@ If a file has already been sent (same content hash):
 - File is skipped with message: `[filename] Already sent (skipping)`
 - Processing continues with next file
 
-## Gmail Rate Limits
+## Parallel Processing & Rate Limits
 
-Gmail allows **500 emails per 24 hours**. The default delay of 300 seconds (5 minutes) between emails ensures compliance:
+### Gmail Rate Limits (Sequential Mode Only)
+
+Gmail allows **500 emails per 24 hours**. Use sequential mode with delay:
+
+```bash
+emailautomation --id 1 --delay 300 --markdown-file reports
+```
 
 - 24 hours = 86,400 seconds
 - 86,400 ÷ 500 = 172.8 seconds minimum
 - Default: 300 seconds provides a safety margin
+- **Do not use parallel mode with Gmail** (will hit rate limits)
 
-**💡 For Higher Throughput**: Consider using **AWS SES** instead of Gmail for faster sending. AWS SES can send emails **14x faster** than Gmail (up to 50,000+ emails/day vs. 500 for Gmail). See [AWS SES Optimization](#aws-ses-optimization-high-speed-sending) section for details.
+### AWS SES with Parallel Processing (Recommended)
 
-### Adjusting Delay
+AWS SES supports **much higher throughput** with parallel processing:
 
-```yaml
+```bash
+emailautomation --id 3 --parallel 10 --domain-filter --emailverify --markdown-file reports
+```
+
+**AWS SES Limits:**
+- Up to 50,000 emails per 24 hours (depending on account)
+- 14 emails per second (enforced by rate limiter)
+- Parallel mode automatically manages rate limiting
+
+**Performance Comparison:**
+
+| Provider | Mode | Workers | Throughput | Time for 1000 emails |
+|----------|------|---------|------------|---------------------|
+| Gmail | Sequential | 1 | 12/hour | ~83 hours |
+| AWS SES | Sequential | 1 | 3,600/hour | ~17 minutes |
+| AWS SES | Parallel | 10 | 50,400/hour | ~1.2 minutes |
+| AWS SES | Parallel | 50 | 50,400/hour | ~1.2 minutes |
+
+**💡 Recommendation**: Use `--parallel 10` to `--parallel 50` with AWS SES for optimal throughput while maintaining safety margins.
+
+### Choosing the Right Mode
+
+**For Gmail (Sequential Mode Only):**
+```bash
 # Conservative (10 minutes between emails)
 emailautomation --delay 600
 
 # Aggressive (2 minutes between emails) - may hit rate limits
 emailautomation --delay 120
 
-# No delay - NOT recommended for Gmail
-emailautomation --delay 0
+# Default (5 minutes) - recommended
+emailautomation --delay 300
+```
 
-# AWS SES: Can use 1-second delay (much higher limits)
+**For AWS SES (Parallel Mode Recommended):**
+```bash
+# Optimal: 10 workers with automatic rate limiting
+emailautomation --id 3 --parallel 10 --domain-filter --emailverify
+
+# Maximum throughput: 50 workers
+emailautomation --id 3 --parallel 50 --domain-filter --emailverify
+
+# Sequential mode (if needed): 1-second delay
 emailautomation --id 3 --delay 1 --domain-filter --emailverify
 ```
 
